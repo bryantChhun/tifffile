@@ -1,6 +1,6 @@
 # tifffile.py
 
-# Copyright (c) 2008-2020, Christoph Gohlke
+# Copyright (c) 2008-2021, Christoph Gohlke
 # All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
@@ -71,16 +71,16 @@ For command line usage run ``python -m tifffile --help``
 
 :License: BSD 3-Clause
 
-:Version: 2020.12.8
+:Version: 2021.2.1
 
 Requirements
 ------------
 This release has been tested with the following requirements and dependencies
 (other versions may work):
 
-* `CPython 3.7.9, 3.8.6, 3.9.1 64-bit <https://www.python.org>`_
-* `Numpy 1.19.4 <https://pypi.org/project/numpy/>`_
-* `Imagecodecs 2020.5.30 <https://pypi.org/project/imagecodecs/>`_
+* `CPython 3.7.9, 3.8.7, 3.9.1 64-bit <https://www.python.org>`_
+* `Numpy 1.19.5 <https://pypi.org/project/numpy/>`_
+* `Imagecodecs 2021.1.28 <https://pypi.org/project/imagecodecs/>`_
   (required only for encoding or decoding LZW, JPEG, etc.)
 * `Matplotlib 3.3.3 <https://pypi.org/project/matplotlib/>`_
   (required only for plotting)
@@ -91,8 +91,24 @@ This release has been tested with the following requirements and dependencies
 
 Revisions
 ---------
+2021.2.1
+    Pass 4384 tests.
+    Fix multi-threaded access of ZarrTiffStores using same TiffFile instance.
+    Use fallback zlib and lzma codecs with imagecodecs lite builds.
+    Open Olympus and Panasonic RAW files for parsing, albeit not supported.
+    Support X2 and X4 differencing found in DNG.
+    Support reading JPEG_LOSSY compression found in DNG.
+2021.1.14
+    Try ImageJ series if OME series fails (#54)
+    Add option to use pages as chunks in ZarrFileStore (experimental).
+    Fix reading from file objects with no readinto function.
+2021.1.11
+    Fix test errors on PyPy.
+    Fix decoding bitorder with imagecodecs >= 2021.1.11.
+2021.1.8
+    Decode float24 using imagecodecs >= 2021.1.8.
+    Consolidate reading of segments if possible.
 2020.12.8
-    Pass 4376 tests.
     Fix corrupted ImageDescription in multi shaped series if buffer too small.
     Fix libtiff warning that ImageDescription contains null byte in value.
     Fix reading invalid files using JPEG compression with palette colorspace.
@@ -447,6 +463,11 @@ Iterate over all tags in the TIFF file:
 ...         for tag in page.tags:
 ...             tag_name, tag_value = tag.name, tag.value
 
+Overwrite the value of an existing tag, e.g. XResolution:
+
+>>> with TiffFile('temp.tif', mode='r+b') as tif:
+...     _ = tif.pages[0].tags['XResolution'].overwrite(tif, (96000, 1000))
+
 Write a floating-point ndarray and metadata using BigTIFF format, tiling,
 compression, and planar storage:
 
@@ -606,48 +627,59 @@ as numpy or zarr arrays:
 
 """
 
-__version__ = '2020.12.8'
+__version__ = '2021.2.1'
 
 __all__ = (
-    'imwrite',
-    'imread',
-    'imshow',
-    'memmap',
-    'lsm2bin',
-    'TiffFileError',
+    'OmeXml',
+    'OmeXmlError',
+    'TIFF',
     'TiffFile',
-    'TiffWriter',
-    'TiffReader',
-    'TiffSequence',
+    'TiffFileError',
+    'TiffFrame',
     'TiffPage',
     'TiffPageSeries',
-    'TiffFrame',
+    'TiffReader',
+    'TiffSequence',
     'TiffTag',
-    'TIFF',
-    'OmeXmlError',
-    'OmeXml',
+    'TiffTags',
+    'TiffWriter',
+    'ZarrFileStore',
+    'ZarrStore',
+    'ZarrTiffStore',
+    'imread',
+    'imshow',
+    'imwrite',
+    'lsm2bin',
+    'memmap',
     'read_micromanager_metadata',
     'read_scanimage_metadata',
+    'tiffcomment',
     # utility classes and functions used by oiffile, czifile, etc.
+    'FileCache',
     'FileHandle',
     'FileSequence',
     'Timer',
+    'askopenfilename',
+    'astype',
+    'create_output',
+    'enumarg',
+    'enumstr',
+    'format_size',
     'lazyattr',
+    'matlabstr2py',
     'natural_sorted',
+    'nullfunc',
+    'parse_kwargs',
+    'pformat',
+    'product',
+    'repeat_nd',
+    'reshape_axes',
+    'reshape_nd',
+    'squeeze_axes',
     'stripnull',
     'transpose_axes',
-    'squeeze_axes',
-    'create_output',
-    'repeat_nd',
-    'format_size',
-    'astype',
-    'product',
-    'xml2dict',
-    'pformat',
-    'nullfunc',
     'update_kwargs',
-    'parse_kwargs',
-    'askopenfilename',
+    'xml2dict',
     '_app_show',
     # deprecated
     'imsave',
@@ -1120,7 +1152,7 @@ class TiffWriter:
         """Write numpy ndarray to a series of TIFF pages.
 
         The ND image data are written to a series of TIFF pages/IFDs.
-        By default, metadata in JSON, ImageJ or OME-XML format are written
+        By default, metadata in JSON, ImageJ, or OME-XML format are written
         to the ImageDescription tag of the first page to describe the series
         such that the image data can later be read back as a ndarray of same
         shape.
@@ -1133,10 +1165,10 @@ class TiffWriter:
         If 'shape' and 'dtype' are specified instead of 'data', an empty array
         is saved. This option cannot be used with compression, predictors,
         packed integers, bilevel images, or multiple tiles.
-        If 'shape', 'dtype', and 'tile' are specified, 'data' must be a
+        If 'shape', 'dtype', and 'tile' are specified, 'data' must be an
         iterable of all tiles in the image.
-        If 'shape' and 'dtype' are specified but not 'tile', 'data' must be a
-        iterable of all single planes in the image.
+        If 'shape', 'dtype', and 'data' are specified but not 'tile', 'data'
+        must be an iterable of all single planes in the image.
         Image data are written uncompressed in one strip per plane by default.
         Dimensions larger than 2 to 4 (depending on photometric mode, planar
         configuration, and volumetric mode) are flattened and saved as separate
@@ -1550,7 +1582,16 @@ class TiffWriter:
             predictortag = 1
 
         if predictor:
-            if compressiontag in (7, 33003, 33005, 34712, 34933, 34934, 50001):
+            if compressiontag in (
+                7,
+                33003,
+                33005,
+                34712,
+                34892,
+                34933,
+                34934,
+                50001,
+            ):
                 # disable predictor for JPEG, JPEG2000, WEBP, PNG, JPEGXR
                 predictor = False
             elif datadtype.kind in 'iu':
@@ -2884,6 +2925,13 @@ class TiffFile:
                     self.tiff = TIFF.NDPI_LE
                 else:
                     self.tiff = TIFF.CLASSIC_LE
+            elif version == 0x55 or version == 0x4F52 or version == 0x5352:
+                # Panasonic or Olympus RAW
+                log_warning(f'RAW format 0x{version:04X} not supported')
+                if byteorder == '>':
+                    self.tiff = TIFF.CLASSIC_BE
+                else:
+                    self.tiff = TIFF.CLASSIC_LE
             else:
                 raise TiffFileError(f'invalid TIFF version {version}')
 
@@ -3076,12 +3124,12 @@ class TiffFile:
             result.shape = (-1,) + pages[0].shape
         return result
 
-    def aszarr(self, key=None, series=None, level=None):
+    def aszarr(self, key=None, series=None, level=None, **kwargs):
         """Return image data from selected TIFF page(s) as zarr storage."""
         if not self.pages:
             raise NotImplementedError('empty zarr arrays not supported')
         if key is None and series is None:
-            return self.series[0].aszarr(level=level)
+            return self.series[0].aszarr(level=level, **kwargs)
         if series is None:
             pages = self.pages
         else:
@@ -3090,10 +3138,10 @@ class TiffFile:
             except (KeyError, TypeError):
                 pass
             if key is None:
-                return series.aszarr(level=level)
+                return series.aszarr(level=level, **kwargs)
             pages = series.pages
         if isinstance(key, (int, numpy.integer)):
-            return pages[key].aszarr()
+            return pages[key].aszarr(**kwargs)
         raise TypeError('key must be an integer index')
 
     @lazyattr
@@ -3128,6 +3176,12 @@ class TiffFile:
         ):
             if getattr(self, 'is_' + name, False):
                 series = getattr(self, '_series_' + name)()
+                if not series and name == 'ome' and self.is_imagej:
+                    # try ImageJ series if OME series fails.
+                    # clear pages cache since _series_ome() might leave some
+                    # frames without keyframe
+                    self.pages._clear()
+                    continue
                 break
         self.pages.useframes = useframes
         self.pages.keyframe = keyframe
@@ -5800,8 +5854,8 @@ class TiffPage:
                 data = numpy.pad(data, padwidth, constant_values=nodata)
                 return data, data.shape
 
-        if self.compression in (6, 7):
-            # COMPRESSION.JPEG needs special handling
+        if self.compression in (6, 7, 34892):
+            # JPEG needs special handling
             if self.fillorder == 2:
                 log_warning(
                     f'TiffPage {self.index}: disabling LSB2MSB for JPEG'
@@ -5915,6 +5969,16 @@ class TiffPage:
                 # return numpy array from packed integers
                 return unpack_rgb(data, dtype, self.bitspersample)
 
+        elif self.bitspersample == 24 and dtype.char == 'f':
+            # float24
+            if unpredict is not None:
+                # floatpred_decode requires numpy.float24, which does not exist
+                raise NotImplementedError('unpredicting float24 not supported')
+
+            def unpack(data, byteorder=self.parent.byteorder):
+                # return numpy.float32 array from float24
+                return float24_decode(data, byteorder)
+
         else:
             # bilevel and packed integers
             def unpack(data):
@@ -5931,7 +5995,7 @@ class TiffPage:
                     data, shape = pad(data, shape)
                 return data, index, shape
             if self.fillorder == 2:
-                data = bitorder_decode(data, out=data)
+                data = bitorder_decode(data)
             if decompress is not None:
                 # TODO: calculate correct size for packed integers
                 size = shape[0] * shape[1] * shape[2] * shape[3]
@@ -5963,7 +6027,7 @@ class TiffPage:
             _fullsize = keyframe.is_tiled
 
         decodeargs = {'_fullsize': bool(_fullsize)}
-        if keyframe.compression in (6, 7):  # COMPRESSION.JPEG
+        if keyframe.compression in (6, 7, 34892):  # JPEG
             decodeargs['jpegtables'] = self.jpegtables
 
         def decode(args, decodeargs=decodeargs, keyframe=keyframe, func=func):
@@ -6000,7 +6064,7 @@ class TiffPage:
     def asarray(self, out=None, squeeze=True, lock=None, maxworkers=None):
         """Read image data from file and return as numpy array.
 
-        Raise ValueError if format is unsupported.
+        Raise ValueError if format is not supported.
 
         Parameters
         ----------
@@ -6334,6 +6398,7 @@ class TiffPage:
             33003,
             33005,
             34712,
+            34892,
             34933,
             34934,
             50001,
@@ -7674,7 +7739,7 @@ class TiffPageSeries:
     offset : int or None
         Position of image data in file if memory-mappable, else None.
     levels : list of TiffPageSeries
-        Pyramid levels.
+        Pyramid levels. levels[0] is 'self'.
 
     """
 
@@ -7858,10 +7923,14 @@ class ZarrStore(MutableMapping):
 
     """
 
-    def __init__(self, fillvalue=None):
+    def __init__(self, fillvalue=None, chunkmode=None):
         """Initialize ZarrStore."""
         self._store = {}
         self._fillvalue = 0 if fillvalue is None else fillvalue
+        if chunkmode is None:
+            self._chunkmode = TIFF.CHUNKMODE(0)
+        else:
+            self._chunkmode = enumarg(TIFF.CHUNKMODE, chunkmode)
 
     def __enter__(self):
         return self
@@ -7983,19 +8052,30 @@ class ZarrTiffStore(ZarrStore):
     """Zarr storage interface to image data in TiffPage or TiffPageSeries."""
 
     def __init__(
-        self, arg, level=None, fillvalue=None, lock=None, _openfiles=None
+        self,
+        arg,
+        level=None,
+        chunkmode=None,
+        fillvalue=None,
+        lock=None,
+        _openfiles=None,
     ):
         """Initialize Zarr storage from TiffPage or TiffPageSeries."""
-        super().__init__(fillvalue=fillvalue)
+        super().__init__(fillvalue=fillvalue, chunkmode=chunkmode)
 
-        if lock is None:
-            lock = threading.RLock()
+        if self._chunkmode not in (0, 2):
+            raise NotImplementedError(f'{self._chunkmode!r} not implemented')
 
-        self._filecache = FileCache(size=_openfiles, lock=lock)
         self._transform = getattr(arg, 'transform', None)
         self._data = getattr(arg, 'levels', [TiffPageSeries([arg])])
         if level is not None:
             self._data = [self._data[level]]
+
+        if lock is None:
+            fh = self._data[0].keyframe.parent._master.filehandle
+            fh.lock = True
+            lock = fh.lock
+        self._filecache = FileCache(size=_openfiles, lock=lock)
 
         if len(self._data) > 1:
             # multiscales
@@ -8019,7 +8099,10 @@ class ZarrTiffStore(ZarrStore):
             for level, series in enumerate(self._data):
                 shape = series.shape
                 dtype = series.dtype
-                chunks = series.keyframe.chunks
+                if self._chunkmode:
+                    chunks = series.keyframe.shape
+                else:
+                    chunks = series.keyframe.chunks
                 self._store[f'{level}/.zarray'] = ZarrStore._json(
                     {
                         'zarr_format': 2,
@@ -8036,7 +8119,10 @@ class ZarrTiffStore(ZarrStore):
             series = self._data[0]
             shape = series.shape
             dtype = series.dtype
-            chunks = series.keyframe.chunks
+            if self._chunkmode:
+                chunks = series.keyframe.shape
+            else:
+                chunks = series.keyframe.chunks
             self._store['.zattrs'] = ZarrStore._json({})
             self._store['.zarray'] = ZarrStore._json(
                 {
@@ -8059,10 +8145,24 @@ class ZarrTiffStore(ZarrStore):
         """Return chunk from file."""
         keyframe, page, chunkindex, offset, bytecount = self._parse_key(key)
 
+        if self._chunkmode:
+            chunks = keyframe.shape
+        else:
+            chunks = keyframe.chunks
+
         if page is None or offset == 0 or bytecount == 0:
-            return ZarrStore._empty_chunk(
-                keyframe.chunks, keyframe.dtype, self._fillvalue
+            chunk = ZarrStore._empty_chunk(
+                chunks, keyframe.dtype, self._fillvalue
             )
+            if self._transform is not None:
+                chunk = self._transform(chunk)
+            return chunk
+
+        if self._chunkmode and offset is None:
+            chunk = page.asarray(lock=self._filecache.lock)  # maxworkers=1 ?
+            if self._transform is not None:
+                chunk = self._transform(chunk)
+            return chunk
 
         chunk = self._filecache.read(page.parent.filehandle, offset, bytecount)
 
@@ -8074,7 +8174,7 @@ class ZarrTiffStore(ZarrStore):
         if self._transform is not None:
             chunk = self._transform(chunk)
 
-        if chunk.size != product(keyframe.chunks):
+        if chunk.size != product(chunks):
             raise RuntimeError
         return chunk  # .tobytes()
 
@@ -8087,7 +8187,7 @@ class ZarrTiffStore(ZarrStore):
         else:
             series = self._data[0]
         keyframe = series.keyframe
-        pageindex, chunkindex = ZarrTiffStore._indices(key, series)
+        pageindex, chunkindex = self._indices(key, series)
         if pageindex > 0 and len(series) == 1:
             # truncated ImageJ, STK, or shaped
             if series.offset is None:
@@ -8097,6 +8197,14 @@ class ZarrTiffStore(ZarrStore):
                 return keyframe, None, chunkindex, 0, 0
             offset = pageindex * page.size * page.dtype.itemsize
             offset += page.dataoffsets[chunkindex]
+            if self._chunkmode:
+                bytecount = page.size * page.dtype.itemsize
+                return keyframe, page, chunkindex, offset, bytecount
+        elif self._chunkmode:
+            page = series[pageindex]
+            if page is None:
+                return keyframe, None, None, 0, 0
+            return keyframe, page, None, None, None
         else:
             page = series[pageindex]
             if page is None:
@@ -8104,6 +8212,59 @@ class ZarrTiffStore(ZarrStore):
             offset = page.dataoffsets[chunkindex]
         bytecount = page.databytecounts[chunkindex]
         return keyframe, page, chunkindex, offset, bytecount
+
+    def _indices(self, key, series):
+        """Return page and strile indices from zarr chunk index."""
+        keyframe = series.keyframe
+        indices = [int(i) for i in key.split('.')]
+        assert len(indices) == len(series.shape)
+        if self._chunkmode:
+            chunked = (1,) * len(keyframe.shape)
+        else:
+            chunked = keyframe.chunked
+        p = 1
+        for i, s in enumerate(series.shape[::-1]):
+            p *= s
+            if p == keyframe.size:
+                i = len(indices) - i - 1
+                frames_indices = indices[:i]
+                strile_indices = indices[i:]
+                frames_chunked = series.shape[:i]
+                strile_chunked = list(series.shape[i:])  # updated later
+                break
+        else:
+            raise RuntimeError
+        if len(strile_chunked) == len(keyframe.shape):
+            strile_chunked = chunked
+        else:
+            # get strile_chunked including singleton dimensions
+            i = len(strile_indices) - 1
+            j = len(keyframe.shape) - 1
+            while True:
+                if strile_chunked[i] == keyframe.shape[j]:
+                    strile_chunked[i] = chunked[j]
+                    i -= 1
+                    j -= 1
+                elif strile_chunked[i] == 1:
+                    i -= 1
+                else:
+                    raise RuntimeError('shape does not match page shape')
+                if i < 0 or j < 0:
+                    break
+            assert product(strile_chunked) == product(chunked)
+        if len(frames_indices) > 0:
+            frameindex = int(
+                numpy.ravel_multi_index(frames_indices, frames_chunked)
+            )
+        else:
+            frameindex = 0
+        if len(strile_indices) > 0:
+            strileindex = int(
+                numpy.ravel_multi_index(strile_indices, strile_chunked)
+            )
+        else:
+            strileindex = 0
+        return frameindex, strileindex
 
     @staticmethod
     def _chunks(chunks, shape):
@@ -8141,63 +8302,16 @@ class ZarrTiffStore(ZarrStore):
         # assert ndim == len(newchunks)
         return tuple(newchunks[::-1])
 
-    @staticmethod
-    def _indices(key, series):
-        """Return page and strile indices from zarr chunk index."""
-        keyframe = series.keyframe
-        indices = [int(i) for i in key.split('.')]
-        assert len(indices) == len(series.shape)
-        p = 1
-        for i, s in enumerate(series.shape[::-1]):
-            p *= s
-            if p == keyframe.size:
-                i = len(indices) - i - 1
-                frames_indices = indices[:i]
-                strile_indices = indices[i:]
-                frames_chunked = series.shape[:i]
-                strile_chunked = list(series.shape[i:])  # updated later
-                break
-        else:
-            raise RuntimeError
-        if len(strile_chunked) == len(keyframe.shape):
-            strile_chunked = keyframe.chunked
-        else:
-            # get strile_chunked including singleton dimensions
-            i = len(strile_indices) - 1
-            j = len(keyframe.shape) - 1
-            while True:
-                if strile_chunked[i] == keyframe.shape[j]:
-                    strile_chunked[i] = keyframe.chunked[j]
-                    i -= 1
-                    j -= 1
-                elif strile_chunked[i] == 1:
-                    i -= 1
-                else:
-                    raise RuntimeError('shape does not match page shape')
-                if i < 0 or j < 0:
-                    break
-            assert product(strile_chunked) == product(keyframe.chunked)
-        if len(frames_indices) > 0:
-            frameindex = int(
-                numpy.ravel_multi_index(frames_indices, frames_chunked)
-            )
-        else:
-            frameindex = 0
-        if len(strile_indices) > 0:
-            strileindex = int(
-                numpy.ravel_multi_index(strile_indices, strile_chunked)
-            )
-        else:
-            strileindex = 0
-        return frameindex, strileindex
-
 
 class ZarrFileStore(ZarrStore):
     """Zarr storage interface to image data in TiffSequence."""
 
-    def __init__(self, arg, fillvalue=None, **kwargs):
+    def __init__(self, arg, fillvalue=None, chunkmode=None, **kwargs):
         """Initialize Zarr storage from FileSequence."""
-        super().__init__(fillvalue=fillvalue)
+        super().__init__(fillvalue=fillvalue, chunkmode=chunkmode)
+
+        if self._chunkmode not in (0, 3):
+            raise NotImplementedError(f'{self._chunkmode!r} not implemented')
 
         if not isinstance(arg, FileSequence):
             raise TypeError('not a FileSequence')
@@ -8718,7 +8832,14 @@ class FileHandle:
         if result.nbytes != nbytes:
             raise ValueError('size mismatch')
 
-        n = self._fh.readinto(result)
+        try:
+            n = self._fh.readinto(result)
+        except AttributeError:
+            result[:] = numpy.frombuffer(self._fh.read(nbytes), dtype).reshape(
+                result.shape
+            )
+            n = nbytes
+
         if n != nbytes:
             raise ValueError(f'failed to read {nbytes} bytes')
 
@@ -8813,6 +8934,7 @@ class FileHandle:
             Iterator over individual or lists of (segment, index) tuples.
 
         """
+        # TODO: Cythonize this?
         length = len(offsets)
         if length < 1:
             return
@@ -8832,7 +8954,7 @@ class FileHandle:
         if lock is None:
             lock = self._lock
         if buffersize is None:
-            buffersize = 2 ** 26  # 64 MB
+            buffersize = 67108864  # 2 ** 26, 64 MB
 
         if indices is None:
             segments = [(i, offsets[i], bytecounts[i]) for i in range(length)]
@@ -8843,15 +8965,64 @@ class FileHandle:
         if sort:
             segments = sorted(segments, key=lambda x: x[1])
 
+        iscontig = True
+        for i in range(length - 1):
+            _, offset, bytecount = segments[i]
+            nextoffset = segments[i + 1][1]
+            if offset == 0 or bytecount == 0 or nextoffset == 0:
+                continue
+            if offset + bytecount != nextoffset:
+                iscontig = False
+                break
+
         seek = self.seek
         read = self._fh.read
+
+        if iscontig:
+            # consolidate reads
+            i = 0
+            while i < length:
+                j = i
+                offset = None
+                bytecount = 0
+                while bytecount < buffersize and i < length:
+                    _, o, b = segments[i]
+                    if o > 0 and b > 0:
+                        if offset is None:
+                            offset = o
+                        bytecount += b
+                    i += 1
+
+                if offset is None:
+                    data = None
+                else:
+                    with lock:
+                        seek(offset)
+                        data = read(bytecount)
+                start = 0
+                stop = 0
+                result = []
+                while j < i:
+                    index, offset, bytecount = segments[j]
+                    if offset > 0 and bytecount > 0:
+                        stop += bytecount
+                        result.append((data[start:stop], index))
+                        start = stop
+                    else:
+                        result.append((None, index))
+                    j += 1
+                if flat:
+                    yield from result
+                else:
+                    yield result
+            return
+
         i = 0
         while i < length:
             result = []
             size = 0
             with lock:
                 while size < buffersize and i < length:
-                    # TODO: consolidate reads?
                     index, offset, bytecount = segments[i]
                     if offset > 0 and bytecount > 0:
                         seek(offset)
@@ -8967,7 +9138,8 @@ class FileCache:
     def read(self, filehandle, offset, bytecount, whence=0):
         """Return bytes read from binary file."""
         with self.lock:
-            if filehandle not in self.files:
+            b = filehandle not in self.files
+            if b:
                 if filehandle.closed:
                     filehandle.open()
                     self.files[filehandle] = 0
@@ -8977,7 +9149,8 @@ class FileCache:
                 self.past.append(filehandle)
             filehandle.seek(offset, whence)
             data = filehandle.read(bytecount)
-            self._trim()
+            if b:
+                self._trim()
         return data
 
     def _trim(self):
@@ -10158,7 +10331,8 @@ class TIFF:
                 (34853, 'GPSTag'),  # GPSIFD  also OlympusSIS2
                 (34853, 'OlympusSIS2'),
                 (34855, 'ISOSpeedRatings'),
-                (34856, 'OECF'),
+                (34855, 'PhotographicSensitivity'),
+                (34856, 'OECF'),  # optoelectric conversion factor
                 (34857, 'Interlace'),
                 (34858, 'TimeZoneOffset'),
                 (34859, 'SelfTimerMode'),
@@ -10311,6 +10485,9 @@ class TIFF:
                 (42035, 'LensMake'),
                 (42036, 'LensModel'),
                 (42037, 'LensSerialNumber'),
+                (42080, 'CompositeImage'),
+                (42081, 'SourceImageNumberCompositeImage'),
+                (42082, 'SourceExposureTimesCompositeImage'),
                 (42112, 'GDAL_METADATA'),
                 (42113, 'GDAL_NODATA'),
                 (42240, 'Gamma'),
@@ -10359,7 +10536,7 @@ class TIFF:
                 (50649, 'CR2Unknown2'),
                 (50656, 'CR2CFAPattern'),
                 (50674, 'LercParameters'),  # ESGI 50674 .. 50677
-                (50706, 'DNGVersion'),  # DNG 50706 .. 51112
+                (50706, 'DNGVersion'),  # DNG 50706 .. 51114
                 (50707, 'DNGBackwardVersion'),
                 (50708, 'UniqueCameraModel'),
                 (50709, 'LocalizedCameraModel'),
@@ -10420,7 +10597,7 @@ class TIFF:
                 (50909, 'GEO_METADATA'),  # DGIWG XML
                 (50931, 'CameraCalibrationSignature'),
                 (50932, 'ProfileCalibrationSignature'),
-                (50933, 'ProfileIFD'),
+                (50933, 'ProfileIFD'),  # EXTRACAMERAPROFILES
                 (50934, 'AsShotProfileName'),
                 (50935, 'NoiseReductionApplied'),
                 (50936, 'ProfileName'),
@@ -10463,10 +10640,18 @@ class TIFF:
                 (51110, 'DefaultBlackRender'),
                 (51111, 'NewRawImageDigest'),
                 (51112, 'RawToPreviewGain'),
-                (51125, 'DefaultUserCrop'),
+                (51113, 'CacheBlob'),
+                (51114, 'CacheVersion'),
                 (51123, 'MicroManagerMetadata'),
+                (51125, 'DefaultUserCrop'),
                 (51159, 'ZIFmetadata'),  # Objective Pathology Services
                 (51160, 'ZIFannotations'),  # Objective Pathology Services
+                (51177, 'DepthFormat'),
+                (51178, 'DepthNear'),
+                (51179, 'DepthFar'),
+                (51180, 'DepthUnits'),
+                (51181, 'DepthMeasureType'),
+                (51182, 'EnhanceParams'),
                 (59932, 'Padding'),
                 (59933, 'OffsetSchema'),
                 # Reusable Tags 65000-65535
@@ -10475,7 +10660,7 @@ class TIFF:
                 # (65000, 'OwnerName'),
                 # (65001, 'SerialNumber'),
                 # (65002, 'Lens'),
-                # (65024, 'KDC_IFD'),
+                # (65024, 'KodakKDCPrivateIFD'),
                 # (65100, 'RawFile'),
                 # (65101, 'Converter'),
                 # (65102, 'WhiteBalance'),
@@ -10757,6 +10942,8 @@ class TIFF:
             NONE = 1
             INCH = 2
             CENTIMETER = 3
+            MILLIMETER = 4  # DNG
+            MICROMETER = 5  # DNG
 
             def __bool__(self):
                 return self != 1
@@ -10953,7 +11140,7 @@ class TIFF:
             (2, 64): 'q',
             # IEEEFP
             (3, 16): 'e',
-            # (3, 24): '',  # 24 bit not supported by numpy
+            (3, 24): 'f',  # float24 bit not supported by numpy
             (3, 32): 'f',
             (3, 64): 'd',
             # COMPLEXIEEEFP
@@ -10981,6 +11168,34 @@ class TIFF:
                         codec = imagecodecs.delta_encode
                     elif key == 3:
                         codec = imagecodecs.floatpred_encode
+                    elif key == 34892:
+
+                        def codec(data, axis=-1, out=None):
+                            return imagecodecs.delta_encode(
+                                data, axis=axis, out=out, dist=2
+                            )
+
+                    elif key == 34893:
+
+                        def codec(data, axis=-1, out=None):
+                            return imagecodecs.delta_encode(
+                                data, axis=axis, out=out, dist=4
+                            )
+
+                    elif key == 34894:
+
+                        def codec(data, axis=-1, out=None):
+                            return imagecodecs.floatpred_encode(
+                                data, axis=axis, out=out, dist=2
+                            )
+
+                    elif key == 34895:
+
+                        def codec(data, axis=-1, out=None):
+                            return imagecodecs.floatpred_encode(
+                                data, axis=axis, out=out, dist=4
+                            )
+
                     else:
                         raise KeyError(f'{key} is not a valid PREDICTOR')
                 except AttributeError:
@@ -11010,6 +11225,34 @@ class TIFF:
                         codec = imagecodecs.delta_decode
                     elif key == 3:
                         codec = imagecodecs.floatpred_decode
+                    elif key == 34892:
+
+                        def codec(data, axis=-1, out=None):
+                            return imagecodecs.delta_decode(
+                                data, axis=axis, out=out, dist=2
+                            )
+
+                    elif key == 34893:
+
+                        def codec(data, axis=-1, out=None):
+                            return imagecodecs.delta_decode(
+                                data, axis=axis, out=out, dist=4
+                            )
+
+                    elif key == 34894:
+
+                        def codec(data, axis=-1, out=None):
+                            return imagecodecs.floatpred_decode(
+                                data, axis=axis, out=out, dist=2
+                            )
+
+                    elif key == 34895:
+
+                        def codec(data, axis=-1, out=None):
+                            return imagecodecs.floatpred_decode(
+                                data, axis=axis, out=out, dist=4
+                            )
+
                     else:
                         raise KeyError(f'{key} is not a valid PREDICTOR')
                 except AttributeError:
@@ -11047,16 +11290,23 @@ class TIFF:
                             and imagecodecs.DEFLATE
                         ):
                             codec = imagecodecs.deflate_encode
-                        else:
+                        elif imagecodecs.ZLIB:
                             codec = imagecodecs.zlib_encode
+                        else:
+                            codec = zlib_encode
                     elif key == 32773:
                         codec = imagecodecs.packbits_encode
                     elif key == 33003 or key == 33005 or key == 34712:
                         codec = imagecodecs.jpeg2k_encode
                     elif key == 34887:
                         codec = imagecodecs.lerc_encode
+                    elif key == 34892:
+                        codec = imagecodecs.jpeg8_encode  # DNG lossy
                     elif key == 34925:
-                        codec = imagecodecs.lzma_encode
+                        if imagecodecs.LZMA:
+                            codec = imagecodecs.lzma_encode
+                        else:
+                            codec = lzma_encode
                     elif key == 34933:
                         codec = imagecodecs.png_encode
                     elif key == 34934:
@@ -11107,18 +11357,23 @@ class TIFF:
                             and imagecodecs.DEFLATE
                         ):
                             codec = imagecodecs.deflate_decode
-                        else:
+                        elif imagecodecs.ZLIB:
                             codec = imagecodecs.zlib_decode
+                        else:
+                            codec = zlib_decode
                     elif key == 32773:
                         codec = imagecodecs.packbits_decode
-                    # elif key == 34892:
-                    #     codec = imagecodecs.jpeg_decode  # DNG lossy
                     elif key == 33003 or key == 33005 or key == 34712:
                         codec = imagecodecs.jpeg2k_decode
                     elif key == 34887:
                         codec = imagecodecs.lerc_decode
+                    elif key == 34892:
+                        codec = imagecodecs.jpeg8_decode  # DNG lossy
                     elif key == 34925:
-                        codec = imagecodecs.lzma_decode
+                        if imagecodecs.LZMA:
+                            codec = imagecodecs.lzma_decode
+                        else:
+                            codec = lzma_decode
                     elif key == 34933:
                         codec = imagecodecs.png_decode
                     elif key == 34934:
@@ -12196,6 +12451,15 @@ class TIFF:
 
         return max(multiprocessing.cpu_count() // 2, 1)
 
+    def CHUNKMODE():
+        class CHUNKMODE(enum.IntEnum):
+            NONE = 0
+            PLANE = 1
+            PAGE = 2
+            FILE = 3
+
+        return CHUNKMODE
+
 
 def read_tags(
     fh, byteorder, offsetsize, tagnames, customtags=None, maxifds=None
@@ -12380,6 +12644,7 @@ def read_json(fh, byteorder, dtype, count, offsetsize):
         return json.loads(stripnull(data).decode())
     except ValueError:
         log_warning('read_json: invalid JSON')
+    return None
 
 
 def read_mm_header(fh, byteorder, dtype, count, offsetsize):
@@ -13790,28 +14055,45 @@ def unpack_rgb(data, dtype=None, bitspersample=None, rescale=True):
     return result.reshape(-1)
 
 
-if imagecodecs is None:
-    import lzma
+def float24_decode(data, byteorder):
+    """Return float32 array from float24."""
+    raise NotImplementedError('float24_decode')
+
+
+def zlib_encode(data, level=None, out=None):
+    """Compress Zlib DEFLATE."""
     import zlib
 
-    def zlib_encode(data, level=6, out=None):
-        """Compress Zlib DEFLATE."""
-        return zlib.compress(data, level)
+    return zlib.compress(data, 6 if level is None else level)
 
-    def zlib_decode(data, out=None):
-        """Decompress Zlib DEFLATE."""
-        return zlib.decompress(data)
 
-    def lzma_encode(data, level=None, out=None):
-        """Compress LZMA."""
-        return lzma.compress(data)
+def zlib_decode(data, out=None):
+    """Decompress Zlib DEFLATE."""
+    import zlib
 
-    def lzma_decode(data, out=None):
-        """Decompress LZMA."""
-        return lzma.decompress(data)
+    return zlib.decompress(data)
 
-    def delta_encode(data, axis=-1, out=None):
+
+def lzma_encode(data, level=None, out=None):
+    """Compress LZMA."""
+    import lzma
+
+    return lzma.compress(data)
+
+
+def lzma_decode(data, out=None):
+    """Decompress LZMA."""
+    import lzma
+
+    return lzma.decompress(data)
+
+
+if imagecodecs is None:
+
+    def delta_encode(data, axis=-1, dist=1, out=None):
         """Encode Delta."""
+        if dist != 1:
+            raise NotImplementedError(f'dist {dist} not implemented')
         if isinstance(data, (bytes, bytearray)):
             data = numpy.frombuffer(data, dtype='u1')
             diff = numpy.diff(data, axis=0)
@@ -13830,8 +14112,10 @@ if imagecodecs is None:
             return diff.view(dtype)
         return diff
 
-    def delta_decode(data, axis=-1, out=None):
+    def delta_decode(data, axis=-1, dist=1, out=None):
         """Decode Delta."""
+        if dist != 1:
+            raise NotImplementedError(f'dist {dist} not implemented')
         if out is not None and not out.flags.writeable:
             out = None
         if isinstance(data, (bytes, bytearray)):
@@ -13971,6 +14255,10 @@ else:
     bitorder_decode = imagecodecs.bitorder_decode  # noqa
     packints_decode = imagecodecs.packints_decode  # noqa
     packints_encode = imagecodecs.packints_encode  # noqa
+    try:
+        float24_decode = imagecodecs.float24_decode  # noqa
+    except AttributeError:
+        pass
 
 
 def apply_colormap(image, colormap, contig=True):

@@ -1,6 +1,6 @@
 # test_tifffile.py
 
-# Copyright (c) 2008-2020, Christoph Gohlke
+# Copyright (c) 2008-2021, Christoph Gohlke
 # All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
@@ -42,7 +42,7 @@ Private data files are not available due to size and copyright restrictions.
 
 :License: BSD 3-Clause
 
-:Version: 2020.12.8
+:Version: 2021.2.1
 
 """
 
@@ -51,6 +51,7 @@ import datetime
 import glob
 import json
 import math
+import mmap
 import os
 import pathlib
 import random
@@ -181,8 +182,9 @@ SKIP_PRIVATE = False  # skip private files
 SKIP_VALIDATE = True  # skip validate written files with jhove
 SKIP_CODECS = False
 SKIP_ZARR = False
+SKIP_PYPY = 'PyPy' in sys.version
 SKIP_BE = sys.byteorder == 'big'
-REASON = 'just skip it'
+REASON = 'skipped'
 
 if sys.maxsize < 2 ** 32:
     SKIP_LARGE = True
@@ -329,13 +331,13 @@ def assert_decode_method(page, image=None):
         assert image.reshape(page.shaped)[index] == strile[0, 0, 0, 0]
 
 
-def assert_aszarr_method(obj, image=None, **kwargs):
+def assert_aszarr_method(obj, image=None, chunkmode=None, **kwargs):
     """Assert aszarr returns same data as asarray."""
     if SKIP_ZARR:
         return
     if image is None:
         image = obj.asarray(**kwargs)
-    with obj.aszarr(**kwargs) as store:
+    with obj.aszarr(chunkmode=chunkmode, **kwargs) as store:
         data = zarr.open(store, mode='r')
         if isinstance(data, zarr.Group):
             data = data[0]
@@ -349,7 +351,9 @@ class TempFileName:
     def __init__(self, name=None, ext='.tif', remove=False):
         self.remove = remove or TEMP_DIR == tempfile.gettempdir()
         if not name:
-            self.name = tempfile.NamedTemporaryFile(prefix='test_').name
+            fh = tempfile.NamedTemporaryFile(prefix='test_')
+            self.name = fh.named
+            fh.close()
         else:
             self.name = os.path.join(TEMP_DIR, f'test_{name}{ext}')
 
@@ -396,7 +400,7 @@ def test_issue_deprecated_import():
 def test_issue_imread_kwargs():
     """Test that is_flags are handled by imread."""
     data = random_data('uint16', (5, 63, 95))
-    with TempFileName(f'issue_imread_kwargs') as fname:
+    with TempFileName('issue_imread_kwargs') as fname:
         with TiffWriter(fname) as tif:
             for image in data:
                 tif.write(image)  # create 5 series
@@ -1041,6 +1045,40 @@ def test_issue_write_separated():
             assert_array_equal(page.asarray(), extrasample)
 
 
+@pytest.mark.skipif(SKIP_PRIVATE, reason=REASON)
+def test_issue_mmap():
+    """Test reading from mmap object with no readinto function.."""
+    fname = public_file('OME/bioformats-artificial/4D-series.ome.tiff')
+    with open(fname, 'rb') as fh:
+        mm = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+        assert_array_equal(imread(mm), imread(fname))
+        mm.close()
+
+
+@pytest.mark.skipif(SKIP_PRIVATE, reason=REASON)
+def test_issue_micromanager(caplog):
+    """Test fallback to ImageJ metadata if OME series fails."""
+    # https://github.com/cgohlke/tifffile/issues/54
+    # https://forum.image.sc/t/47567/9
+    # OME-XML does not contain reference to master file
+    # file has corrupt MicroManager DisplaySettings metadata
+    fname = private_file(
+        'OME/'
+        'image_stack_tpzc_50tp_2p_5z_3c_512k_1_MMStack_2-Pos001_000.ome.tif'
+    )
+    with TiffFile(fname) as tif:
+        assert len(tif.pages) == 750
+        assert len(tif.series) == 1
+        assert 'OME series: not an ome-tiff master file' in caplog.text
+        assert tif.is_micromanager
+        assert tif.is_ome
+        assert tif.is_imagej
+        assert tif.micromanager_metadata['DisplaySettings'] is None
+        assert 'read_json: invalid JSON' in caplog.text
+        series = tif.series[0]
+        assert series.shape == (50, 5, 3, 256, 256)
+
+
 ###############################################################################
 
 # Test specific functions and classes
@@ -1306,13 +1344,13 @@ def test_class_tifftags():
 def test_class_tifftagregistry():
     """Test TiffTagRegistry."""
     tags = TIFF.TAGS
-    assert len(tags) == 620
+    assert len(tags) == 632
     assert tags[11] == 'ProcessingSoftware'
     assert tags['ProcessingSoftware'] == 11
     assert tags.getall(11) == ['ProcessingSoftware']
     assert tags.getall('ProcessingSoftware') == [11]
     tags.add(11, 'ProcessingSoftware')
-    assert len(tags) == 620
+    assert len(tags) == 632
 
     # one code with two names
     assert 34853 in tags
@@ -1325,7 +1363,7 @@ def test_class_tifftagregistry():
     assert tags.getall('GPSTag') == [34853]
 
     del tags[34853]
-    assert len(tags) == 618
+    assert len(tags) == 630
     assert 34853 not in tags
     assert 'GPSTag' not in tags
     assert 'OlympusSIS2' not in tags
@@ -1351,7 +1389,7 @@ def test_class_tifftagregistry():
     assert tags.getall(41483) == ['FlashEnergy']
 
     del tags['FlashEnergy']
-    assert len(tags) == 618
+    assert len(tags) == 630
     assert 37387 not in tags
     assert 41483 not in tags
     assert 'FlashEnergy' not in tags
@@ -1612,13 +1650,15 @@ def test_class_omexml_attributes():
 
     omexml = OmeXml(**metadata)
     omexml.addimage('uint16', (3, 32, 32, 3), (3, 1, 1, 32, 32, 3), **metadata)
+    xml = omexml.tostring()
+    assert uuid in xml
+    assert 'SignificantBits="12"' in xml
+    assert 'SamplesPerPixel="3" Name="ChannelName"' in xml
+    assert 'TheC="0" TheZ="2" TheT="0" PositionZ="4.0"' in xml
+    if SKIP_PYPY:
+        pytest.xfail('lxml bug?')
+    assert_valid_omexml(xml)
     assert '\n  ' in str(omexml)
-    omexml = omexml.tostring()
-    assert_valid_omexml(omexml)
-    assert uuid in omexml
-    assert 'SignificantBits="12"' in omexml
-    assert 'SamplesPerPixel="3" Name="ChannelName"' in omexml
-    assert 'TheC="0" TheZ="2" TheT="0" PositionZ="4.0"' in omexml
 
 
 def test_class_omexml_multiimage():
@@ -2581,7 +2621,7 @@ def test_func_create_output_asarray(out, key):
     """Test create_output function in context of asarray."""
     data = random_data('uint16', (5, 219, 301))
 
-    with TempFileName('out') as fname:
+    with TempFileName(f'out_{key}_{out}') as fname:
         imwrite(fname, data)
         # assert file
         with TiffFile(fname) as tif:
@@ -2631,7 +2671,9 @@ def test_func_create_output_asarray(out, key):
                 del image
             elif out == 'name':
                 # memmap in specified file
-                with TempFileName('out', ext='.memmap') as fileout:
+                with TempFileName(
+                    f'out_{key}_{out}', ext='.memmap'
+                ) as fileout:
                     image = obj.asarray(out=fileout)
                     assert isinstance(image, numpy.core.memmap)
                     assert_array_equal(dat, image)
@@ -2947,10 +2989,10 @@ def test_read_tigers(fname):
             assert page.photometric == MINISBLACK
 
         # float24 not supported
-        if 'float' in fname and databits == 24:
-            with pytest.raises(ValueError):
-                data = tif.asarray()
-            return
+        # if 'float' in fname and databits == 24:
+        #     with pytest.raises(ValueError):
+        #         data = tif.asarray()
+        #     return
 
         # assert data shapes
         data = tif.asarray()
@@ -2974,7 +3016,10 @@ def test_read_tigers(fname):
 
         # assert data types
         if 'float' in fname:
-            dtype = f'float{databits}'
+            if databits == 24:
+                dtype = 'float32'
+            else:
+                dtype = f'float{databits}'
         # elif 'palette' in fname:
         #     dtype = 'uint16'
         elif databits == 1:
@@ -3231,6 +3276,56 @@ def test_read_gimp_f2():
             (0.35571289, 0.26391602, 0.62792969),
         )
         assert_aszarr_method(tif, image)
+        assert__str__(tif)
+
+
+@pytest.mark.skipif(SKIP_PRIVATE or SKIP_CODECS, reason=REASON)
+def test_read_dng_jpeglossy():
+    """Test read JPEG_LOSSY in DNG."""
+    fname = private_file('DNG/Adobe DNG Converter.dng')
+    with TiffFile(fname) as tif:
+        assert len(tif.pages) == 1
+        assert len(tif.series) == 6
+        for series in tif.series:
+            image = series.asarray()
+            assert_aszarr_method(series, image)
+        assert__str__(tif)
+
+
+@pytest.mark.skipif(SKIP_PRIVATE or SKIP_CODECS, reason=REASON)
+@pytest.mark.parametrize('fp', ['fp16', 'fp24', 'fp32'])
+def test_read_dng_floatpredx2(fp):
+    """Test read FLOATINGPOINTX2 predictor in DNG."""
+    # <https://raw.pixls.us/data/Canon/EOS%205D%20Mark%20III/>
+    fname = private_file(f'DNG/fpx2/hdrmerge-bayer-{fp}-w-pred-deflate.dng')
+    with TiffFile(fname) as tif:
+        assert len(tif.pages) == 1
+        assert len(tif.series) == 3
+        page = tif.pages[0].pages[0]
+        assert page.compression == ADOBE_DEFLATE
+        assert page.photometric == CFA
+        assert page.imagewidth == 5920
+        assert page.imagelength == 3950
+        assert page.sampleformat == 3
+        assert page.bitspersample == int(fp[2:])
+        assert page.samplesperpixel == 1
+        assert page.predictor == 34894
+        if fp == 'fp24':
+            with pytest.raises(NotImplementedError):
+                image = page.asarray()
+        else:
+            image = page.asarray()
+            assert_aszarr_method(page, image)
+        assert__str__(tif)
+
+
+@pytest.mark.skipif(SKIP_PRIVATE, reason=REASON)
+@pytest.mark.parametrize('fname', ['sample1.orf', 'sample1.rw2'])
+def test_read_rawformats(fname, caplog):
+    """Test parse unsupported RAW formats."""
+    fname = private_file(f'RAWformats/{fname}')
+    with TiffFile(fname) as tif:
+        assert 'RAW format' in caplog.text
         assert__str__(tif)
 
 
@@ -6610,6 +6705,7 @@ def test_read_ome_multifile():
         assert__str__(tif)
         # test aszarr
         assert_aszarr_method(tif, data)
+        assert_aszarr_method(tif, data, chunkmode='page')
         del data
         # assert other files are still closed after ZarrFileStore.close
         for page in tif.series[0].pages:
@@ -6661,6 +6757,7 @@ def test_read_ome_multifile_missing(caplog):
         assert data.dtype.name == 'uint8'
         assert data[1, 42, 9, 426, 272] == 123
         assert_aszarr_method(tif, data)
+        assert_aszarr_method(tif, data, chunkmode='page')
         del data
         assert__str__(tif)
 
@@ -6697,6 +6794,7 @@ def test_read_ome_rgb():
         assert data.dtype.name == 'uint8'
         assert data[1, 158, 428] == 253
         assert_aszarr_method(tif, data)
+        assert_aszarr_method(tif, data, chunkmode='page')
         assert__str__(tif)
 
 
@@ -6730,6 +6828,7 @@ def test_read_ome_samplesperpixel():
         assert data.dtype.name == 'uint8'
         assert tuple(data[5, :, 191, 449]) == (253, 0, 28)
         assert_aszarr_method(tif, data)
+        assert_aszarr_method(tif, data, chunkmode='page')
         assert__str__(tif)
 
 
@@ -6765,6 +6864,7 @@ def test_read_ome_float_modulo_attributes():
         assert data.dtype.name == 'uint16'
         assert data[1, 158, 428] == 51
         assert_aszarr_method(tif, data)
+        assert_aszarr_method(tif, data, chunkmode='page')
         assert__str__(tif)
 
 
@@ -6800,6 +6900,7 @@ def test_read_ome_cropped(caplog):
         assert data.dtype.name == 'uint16'
         assert data[4, 9, 1, 175, 123] == 9605
         assert_aszarr_method(tif, data)
+        assert_aszarr_method(tif, data, chunkmode='page')
         del data
         assert__str__(tif)
 
@@ -6833,6 +6934,7 @@ def test_read_ome_corrupted_page(caplog):
         assert data.dtype.name == 'uint16'
         assert tuple(data[:, 2684, 2684]) == (496, 657, 7106, 469)
         assert_aszarr_method(tif, data)
+        assert_aszarr_method(tif, data, chunkmode='page')
         del data
         assert__str__(tif)
 
@@ -6943,6 +7045,7 @@ def test_read_ome_jpeg2000_be():
         assert data.dtype.name == 'uint16'
         assert data[0, 0] == 1904
         assert_aszarr_method(page, data)
+        assert_aszarr_method(page, data, chunkmode='page')
         assert__str__(tif)
 
 
@@ -6980,6 +7083,7 @@ def test_read_andor_light_sheet_512p():
         assert data.dtype.name == 'uint16'
         assert round(abs(data[50, 256, 256] - 703), 7) == 0
         assert_aszarr_method(tif, data)
+        assert_aszarr_method(tif, data, chunkmode='page')
         assert__str__(tif, 0)
 
 
@@ -7016,6 +7120,7 @@ def test_read_nih_morph():
         assert data.dtype.name == 'uint8'
         assert data[195, 144] == 41
         assert_aszarr_method(tif, data)
+        assert_aszarr_method(tif, data, chunkmode='page')
         assert__str__(tif)
 
 
@@ -7090,6 +7195,7 @@ def test_read_nih_scala_media():
         assert data.dtype.name == 'uint8'
         assert data[35, 35, 65] == 171
         assert_aszarr_method(tif, data)
+        assert_aszarr_method(tif, data, chunkmode='page')
         assert__str__(tif)
 
 
@@ -7132,6 +7238,7 @@ def test_read_imagej_rrggbb():
         assert tuple(data[:, 15, 15]) == (812, 1755, 648)
         assert_decode_method(page)
         assert_aszarr_method(series, data)
+        assert_aszarr_method(series, data, chunkmode='page')
         assert__str__(tif, 0)
 
 
@@ -7170,6 +7277,7 @@ def test_read_imagej_focal1():
         assert data.dtype.name == 'uint8'
         assert data[102, 216, 212] == 120
         assert_aszarr_method(series, data)
+        assert_aszarr_method(series, data, chunkmode='page')
         assert__str__(tif, 0)
 
 
@@ -7205,6 +7313,7 @@ def test_read_imagej_hela_cells():
         assert data.dtype.name == 'uint16'
         assert tuple(data[255, 336]) == (440, 378, 298)
         assert_aszarr_method(series, data)
+        assert_aszarr_method(series, data, chunkmode='page')
         assert__str__(tif)
 
 
@@ -7239,6 +7348,7 @@ def test_read_imagej_flybrain():
         assert data.dtype.name == 'uint8'
         assert tuple(data[18, 108, 97]) == (165, 157, 0)
         assert_aszarr_method(series, data)
+        assert_aszarr_method(series, data, chunkmode='page')
         assert__str__(tif)
 
 
@@ -7286,6 +7396,7 @@ def test_read_imagej_confocal_series():
         assert tif.pages.pages[2] == 8001073
         assert tif.pages.pages[-1] == 8008687
         assert_aszarr_method(series, data)
+        assert_aszarr_method(series, data, chunkmode='page')
         assert__str__(tif)
 
 
@@ -7513,6 +7624,7 @@ def test_read_imagej_invalid_metadata(caplog):
         assert data.dtype.name == 'uint16'
         assert data[94, 34] == 1257
         assert_aszarr_method(series, data)
+        assert_aszarr_method(series, data, chunkmode='page')
         assert__str__(tif)
         del data
 
@@ -7587,6 +7699,7 @@ def test_read_fluoview_lsp1_v_laser():
         assert data.dtype.name == 'uint16'
         assert round(abs(data[1, 36, 128, 128] - 824), 7) == 0
         assert_aszarr_method(series, data)
+        assert_aszarr_method(series, data, chunkmode='page')
         assert__str__(tif)
 
 
@@ -7655,6 +7768,7 @@ def test_read_metaseries():
         assert data.dtype.name == 'uint16'
         assert data[256, 256] == 1917
         assert_aszarr_method(series, data)
+        assert_aszarr_method(series, data, chunkmode='page')
         assert__str__(tif)
 
 
@@ -7695,6 +7809,7 @@ def test_read_metaseries_g4d7r():
         assert round(abs(data[512, 2856] - 4095), 7) == 0
         if not SKIP_LARGE:
             assert_aszarr_method(series, data)
+            assert_aszarr_method(series, data, chunkmode='page')
         assert__str__(tif)
 
 
@@ -7748,6 +7863,7 @@ def test_read_mdgel_rat():
         assert data.dtype.name == 'float32'
         assert round(abs(data[260, 740] - 399.1728515625), 7) == 0
         assert_aszarr_method(series, data)
+        assert_aszarr_method(series, data, chunkmode='page')
         assert__str__(tif)
 
 
@@ -7782,6 +7898,7 @@ def test_read_mediacy_imagepro():
         assert data.dtype.name == 'uint8'
         assert round(abs(data[120, 34] - 4), 7) == 0
         assert_aszarr_method(series, data)
+        assert_aszarr_method(series, data, chunkmode='page')
         assert__str__(tif)
 
 
@@ -7807,6 +7924,7 @@ def test_read_pilatus_100k():
         assert attr['Tau'] == 1.991e-07
         assert attr['Silicon'] == 0.000320
         assert_aszarr_method(page)
+        assert_aszarr_method(page, chunkmode='page')
         assert__str__(tif)
 
 
@@ -7863,6 +7981,7 @@ def test_read_epics_attrib():
             tags['epicsTSSec'], tags['epicsTSNsec']
         ) == datetime.datetime(2015, 6, 2, 11, 31, 56, 103746)
         assert_aszarr_method(page)
+        assert_aszarr_method(page, chunkmode='page')
         assert__str__(tif)
 
 
@@ -7992,6 +8111,7 @@ def test_read_qpi():
         assert image.dtype == 'uint8'
         assert image[300, 400, 1] == 48
         assert_aszarr_method(tif, image, series=1)
+        assert_aszarr_method(tif, image, series=1, chunkmode='page')
         assert__str__(tif)
 
 
@@ -8025,6 +8145,7 @@ def test_read_philips():
         assert image.shape == (2789, 2677, 3)
         assert image[300, 400, 1] == 206
         assert_aszarr_method(series, image, level=5)
+        assert_aszarr_method(series, image, level=5, chunkmode='page')
         assert__str__(tif)
 
 
@@ -8095,6 +8216,7 @@ def test_read_sis():
         assert sis['name'] == 'Hela-Zellen'
         assert sis['magnification'] == 60.0
         assert_aszarr_method(tif, data)
+        assert_aszarr_method(tif, data, chunkmode='page')
         assert__str__(tif)
 
 
@@ -8864,6 +8986,7 @@ def test_write_truncate():
             data = tif.asarray()
             assert data.shape == shape
             assert_aszarr_method(tif, data)
+            assert_aszarr_method(tif, data, chunkmode='page')
             assert__str__(tif)
 
 
@@ -8888,6 +9011,7 @@ def test_write_is_shaped():
             assert page.is_shaped
             assert page.description == descr
             assert_aszarr_method(page)
+            assert_aszarr_method(page, chunkmode='page')
             assert__str__(tif)
 
 
@@ -9596,7 +9720,7 @@ def test_write_rowsperstrip():
     """Test write rowsperstrip without compression."""
     data = WRITE_DATA
     with TempFileName('rowsperstrip') as fname:
-        imwrite(fname, data, rowsperstrip=32, contiguous=False, metadata=False)
+        imwrite(fname, data, rowsperstrip=32, contiguous=False, metadata=None)
         assert_valid_tiff(fname)
         with TiffFile(fname) as tif:
             assert len(tif.pages) == 1
@@ -9710,6 +9834,7 @@ def test_write_pixel():
             image = tif.asarray()
             assert_array_equal(data, image)
             assert_aszarr_method(tif, image)
+            assert_aszarr_method(tif, image, chunkmode='page')
             assert__str__(tif)
 
 
@@ -9754,6 +9879,7 @@ def test_write_2d_as_rgb():
             image = tif.asarray()
             assert_array_equal(data, image)
             assert_aszarr_method(tif, image)
+            assert_aszarr_method(tif, image, chunkmode='page')
             assert__str__(tif)
 
 
@@ -10927,6 +11053,7 @@ def test_write_volumetric_striped_png():
             image = tif.asarray()
             assert_array_equal(data, image)
             assert_aszarr_method(tif, image)
+            assert_aszarr_method(tif, image, chunkmode='page')
             assert__str__(tif)
 
 

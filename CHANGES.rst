@@ -1,7 +1,23 @@
 Revisions
 ---------
+2021.2.1
+    Pass 4384 tests.
+    Fix multi-threaded access of ZarrTiffStores using same TiffFile instance.
+    Use fallback zlib and lzma codecs with imagecodecs lite builds.
+    Open Olympus and Panasonic RAW files for parsing, albeit not supported.
+    Support X2 and X4 differencing found in DNG.
+    Support reading JPEG_LOSSY compression found in DNG.
+2021.1.14
+    Try ImageJ series if OME series fails (#54)
+    Add option to use pages as chunks in ZarrFileStore (experimental).
+    Fix reading from file objects with no readinto function.
+2021.1.11
+    Fix test errors on PyPy.
+    Fix decoding bitorder with imagecodecs >= 2021.1.11.
+2021.1.8
+    Decode float24 using imagecodecs >= 2021.1.8.
+    Consolidate reading of segments if possible.
 2020.12.8
-    Pass 4376 tests.
     Fix corrupted ImageDescription in multi shaped series if buffer too small.
     Fix libtiff warning that ImageDescription contains null byte in value.
     Fix reading invalid files using JPEG compression with palette colorspace.
